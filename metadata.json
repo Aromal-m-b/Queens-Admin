@@ -1,0 +1,6 @@
+{
+  "name": "Queens Admin Panel",
+  "description": "Interactive Queens Level Designer, Color Region Builder, and MongoDB sync manager for the Queens puzzle game.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
