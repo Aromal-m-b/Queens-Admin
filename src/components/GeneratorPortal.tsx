@@ -287,6 +287,73 @@ function generateQueenPlacements(N: number): number[][] {
   return placements;
 }
 
+// Highly detailed state validation function to periodically or continuously verify backtracking invariants
+function validateState(state: GeneratorState): void {
+  if (!state) {
+    throw new Error("Generator state is null or undefined.");
+  }
+  const N = state.N;
+  if (typeof N !== "number" || N < 5 || N > 10) {
+    throw new Error(`Invalid board size N: ${N}`);
+  }
+  if (!Array.isArray(state.placements) || state.placements.length === 0) {
+    throw new Error("state.placements is empty or not an array.");
+  }
+  if (state.placementIdx >= state.placements.length) {
+    // Terminal state: the search has completed successfully
+    return;
+  }
+  if (state.placementIdx < 0) {
+    throw new Error(`placementIdx out of bounds: ${state.placementIdx}`);
+  }
+  const placement = state.placements[state.placementIdx];
+  if (!Array.isArray(placement) || placement.length !== N) {
+    throw new Error(`Invalid placement at index ${state.placementIdx}`);
+  }
+  const cells = state.cellsToAssign;
+  if (!Array.isArray(cells)) {
+    throw new Error("state.cellsToAssign is not an array.");
+  }
+  const cellIdx = state.cellIdx;
+  if (typeof cellIdx !== "number" || cellIdx < 0 || cellIdx > cells.length) {
+    throw new Error(`cellIdx out of bounds: cellIdx = ${cellIdx}, cellsToAssign.length = ${cells.length}`);
+  }
+  if (!Array.isArray(state.grid) || state.grid.length !== N) {
+    throw new Error(`Invalid grid row count: ${state.grid?.length}, expected ${N}`);
+  }
+  for (let r = 0; r < N; r++) {
+    const row = state.grid[r];
+    if (!Array.isArray(row) || row.length !== N) {
+      throw new Error(`Invalid grid column count at row ${r}: ${row?.length}, expected ${N}`);
+    }
+    for (let c = 0; c < N; c++) {
+      const val = row[c];
+      if (typeof val !== "number" || val < -1 || val >= N) {
+        throw new Error(`Invalid grid value at [${r}, ${c}]: ${val}`);
+      }
+    }
+  }
+  if (!Array.isArray(state.triedRegionsStack)) {
+    throw new Error("triedRegionsStack is not an array.");
+  }
+
+  // Backtracking State Invariant 1: Any cells strictly after state.cellIdx must be unassigned (-1) in the grid
+  for (let i = cellIdx + 1; i < cells.length; i++) {
+    const cell = cells[i];
+    if (state.grid[cell.r][cell.c] !== -1) {
+      throw new Error(`Inconsistent backtracking state: cell at index ${i} (${cell.r}, ${cell.c}) has value ${state.grid[cell.r][cell.c]}, but expected -1 because cellIdx is currently ${cellIdx}`);
+    }
+  }
+
+  // Backtracking State Invariant 2: triedRegionsStack entries strictly after state.cellIdx must be empty or undefined
+  for (let i = cellIdx + 1; i < state.triedRegionsStack.length; i++) {
+    const tried = state.triedRegionsStack[i];
+    if (tried && tried.length > 0) {
+      throw new Error(`Inconsistent triedRegionsStack: tried stack at index ${i} has length ${tried.length}, but expected empty because cellIdx is currently ${cellIdx}`);
+    }
+  }
+}
+
 export default function GeneratorPortal() {
   const [boardSize, setBoardSize] = useState<number>(6);
   const [isRunning, setIsRunning] = useState<boolean>(false);
@@ -483,137 +550,166 @@ export default function GeneratorPortal() {
 
   // Perform back-track step inside active loop
   const performStep = (state: GeneratorState): boolean => {
-    if (state.placementIdx >= state.placements.length) {
-      return false; // Done!
-    }
+    try {
+      if (state.placementIdx >= state.placements.length) {
+        return false; // Done!
+      }
 
-    const N = state.N;
-    const placement = state.placements[state.placementIdx];
-    const cells = state.cellsToAssign;
-    const cellIdx = state.cellIdx;
+      validateState(state);
 
-    stepCountRef.current++;
+      const N = state.N;
+      const placement = state.placements[state.placementIdx];
+      const cells = state.cellsToAssign;
+      const cellIdx = state.cellIdx;
 
-    // Completed region partition!
-    if (cellIdx === cells.length) {
-      state.boardsChecked = (state.boardsChecked || 0) + 1;
-      
-      // Solver verify uniqueness
-      const uniqStart = performance.now();
-      const isUnique = isUniqueSolution(state.grid);
-      timeUniquenessRef.current += performance.now() - uniqStart;
-      countUniquenessRef.current++;
+      stepCountRef.current++;
 
-      if (isUnique) {
-        const canonical = getUniqueRepresentative(state.grid);
-        if (!state.uniqueCanonicalGridsSet) {
-          state.uniqueCanonicalGridsSet = new Set<string>(state.uniqueCanonicalGrids);
+      // Completed region partition!
+      if (cellIdx === cells.length) {
+        state.boardsChecked = (state.boardsChecked || 0) + 1;
+        
+        // Solver verify uniqueness
+        const uniqStart = performance.now();
+        const isUnique = isUniqueSolution(state.grid);
+        timeUniquenessRef.current += performance.now() - uniqStart;
+        countUniquenessRef.current++;
+
+        if (isUnique) {
+          const canonical = getUniqueRepresentative(state.grid);
+          if (!state.uniqueCanonicalGridsSet) {
+            state.uniqueCanonicalGridsSet = new Set<string>(state.uniqueCanonicalGrids);
+          }
+          if (!state.uniqueCanonicalGridsSet.has(canonical)) {
+            state.uniqueCanonicalGridsSet.add(canonical);
+            state.uniqueCanonicalGrids.push(canonical);
+            state.validBoardsFound = (state.validBoardsFound || 0) + 1;
+            
+            const boardId = `gen-${N}-${state.validBoardsFound}`;
+            const gridStr = state.grid.map(row => row.join(",")).join(";");
+            const solutionStr = placement.map((col, r) => `${r}-${col}`).join(";");
+            
+            const newRecord: BoardRecord = {
+              id: boardId,
+              size: N,
+              grid: gridStr,
+              solution: solutionStr
+            };
+            
+            state.generatedBoards.unshift(newRecord); // insert at start for recent view
+            
+            // Track unique board for high-performance direct paint
+            state.lastFoundUniqueGrid = state.grid.map(row => [...row]);
+            state.lastFoundUniquePlacement = [...placement];
+            state.hasNewUniqueFound = true;
+            
+            // Trigger win sound
+            playPulseSound(1100);
+          }
         }
-        if (!state.uniqueCanonicalGridsSet.has(canonical)) {
-          state.uniqueCanonicalGridsSet.add(canonical);
-          state.uniqueCanonicalGrids.push(canonical);
-          state.validBoardsFound = (state.validBoardsFound || 0) + 1;
-          
-          const boardId = `gen-${N}-${state.validBoardsFound}`;
-          const gridStr = state.grid.map(row => row.join(",")).join(";");
-          const solutionStr = placement.map((col, r) => `${r}-${col}`).join(";");
-          
-          const newRecord: BoardRecord = {
-            id: boardId,
-            size: N,
-            grid: gridStr,
-            solution: solutionStr
-          };
-          
-          state.generatedBoards.unshift(newRecord); // insert at start for recent view
-          
-          // Track unique board for high-performance direct paint
-          state.lastFoundUniqueGrid = state.grid.map(row => [...row]);
-          state.lastFoundUniquePlacement = [...placement];
-          state.hasNewUniqueFound = true;
-          
-          // Trigger win sound
-          playPulseSound(1100);
+        
+        state.cellIdx = cellIdx - 1;
+        return true;
+      }
+
+      const cell = cells[cellIdx];
+      const r = cell.r;
+      const c = cell.c;
+
+      if (!state.triedRegionsStack[cellIdx]) {
+        state.triedRegionsStack[cellIdx] = [];
+      }
+
+      const tried = state.triedRegionsStack[cellIdx];
+      let nextRegion = -1;
+
+      for (let k = 0; k < N; k++) {
+        if (tried.includes(k)) continue;
+
+        let isAdjacent = false;
+        const seedC = placement[k];
+        const seedR = k;
+        
+        if (Math.abs(seedR - r) + Math.abs(seedC - c) === 1) {
+          isAdjacent = true;
+        } else {
+          const neighbors = [
+            { r: r - 1, c },
+            { r: r + 1, c },
+            { r, c: c - 1 },
+            { r, c: c + 1 }
+          ];
+          for (const nb of neighbors) {
+            if (nb.r >= 0 && nb.r < N && nb.c >= 0 && nb.c < N) {
+              if (state.grid[nb.r][nb.c] === k) {
+                isAdjacent = true;
+                break;
+              }
+            }
+          }
+        }
+
+        if (isAdjacent) {
+          nextRegion = k;
+          break;
         }
       }
-      
-      state.cellIdx = cellIdx - 1;
-      return true;
-    }
 
-    const cell = cells[cellIdx];
-    const r = cell.r;
-    const c = cell.c;
+      if (nextRegion !== -1) {
+        tried.push(nextRegion);
+        state.grid[r][c] = nextRegion;
 
-    if (!state.triedRegionsStack[cellIdx]) {
-      state.triedRegionsStack[cellIdx] = [];
-    }
+        // Partial reachability pruning check
+        const reachStart = performance.now();
+        const isReachable = checkPartialReachability(state.grid, placement);
+        timeReachabilityRef.current += performance.now() - reachStart;
+        countReachabilityRef.current++;
 
-    const tried = state.triedRegionsStack[cellIdx];
-    let nextRegion = -1;
-
-    for (let k = 0; k < N; k++) {
-      if (tried.includes(k)) continue;
-
-      let isAdjacent = false;
-      const seedC = placement[k];
-      const seedR = k;
-      
-      if (Math.abs(seedR - r) + Math.abs(seedC - c) === 1) {
-        isAdjacent = true;
+        if (isReachable) {
+          state.cellIdx = cellIdx + 1;
+          state.triedRegionsStack[state.cellIdx] = [];
+        } else {
+          state.grid[r][c] = -1; // invalid path, prune instantly
+        }
       } else {
-        const neighbors = [
-          { r: r - 1, c },
-          { r: r + 1, c },
-          { r, c: c - 1 },
-          { r, c: c + 1 }
-        ];
-        for (const nb of neighbors) {
-          if (nb.r >= 0 && nb.r < N && nb.c >= 0 && nb.c < N) {
-            if (state.grid[nb.r][nb.c] === k) {
-              isAdjacent = true;
-              break;
-            }
+        state.grid[r][c] = -1;
+        state.triedRegionsStack[cellIdx] = [];
+        state.cellIdx = cellIdx - 1;
+
+        if (state.cellIdx < 0) {
+          state.placementIdx++;
+          if (state.placementIdx < state.placements.length) {
+            initializePlacementState(state);
           }
         }
       }
 
-      if (isAdjacent) {
-        nextRegion = k;
-        break;
-      }
+      return true;
+    } catch (error: any) {
+      console.error("CRITICAL EXCEPTION IN QUEENS BACKTRACKING GENERATOR DETECTED!");
+      console.error("Error Message:", error.message || error);
+      console.error("Generator State Dump at point of failure:", {
+        N: state.N,
+        placementIdx: state.placementIdx,
+        cellIdx: state.cellIdx,
+        grid: state.grid ? state.grid.map(row => [...row]) : null,
+        triedRegionsStack: state.triedRegionsStack ? state.triedRegionsStack.map(arr => arr ? [...arr] : []) : null,
+        boardsChecked: state.boardsChecked,
+        validBoardsFound: state.validBoardsFound,
+        uniqueCanonicalGridsCount: state.uniqueCanonicalGrids?.length
+      });
+
+      // Stop the generator loop in the UI
+      setIsRunning(false);
+      isRunningRef.current = false;
+      setStatus("paused");
+      showAlert(`Generator Error: ${error.message || "Unknown error"}. Check DevTools Console.`, "error");
+
+      // Developer debugging statement - will pause the browser developer tools execution
+      debugger;
+
+      // Rethrow to let the user's "Pause on uncaught exceptions" settings in Chrome trigger
+      throw error;
     }
-
-    if (nextRegion !== -1) {
-      tried.push(nextRegion);
-      state.grid[r][c] = nextRegion;
-
-      // Partial reachability pruning check
-      const reachStart = performance.now();
-      const isReachable = checkPartialReachability(state.grid, placement);
-      timeReachabilityRef.current += performance.now() - reachStart;
-      countReachabilityRef.current++;
-
-      if (isReachable) {
-        state.cellIdx = cellIdx + 1;
-        state.triedRegionsStack[state.cellIdx] = [];
-      } else {
-        state.grid[r][c] = -1; // invalid path, prune instantly
-      }
-    } else {
-      state.grid[r][c] = -1;
-      state.triedRegionsStack[cellIdx] = [];
-      state.cellIdx = cellIdx - 1;
-
-      if (state.cellIdx < 0) {
-        state.placementIdx++;
-        if (state.placementIdx < state.placements.length) {
-          initializePlacementState(state);
-        }
-      }
-    }
-
-    return true;
   };
 
   // Execution Loop logic
@@ -625,18 +721,24 @@ export default function GeneratorPortal() {
 
     // Perform multiple steps in a single loop tick for performance, but cap it to 8ms to prevent UI frame-drops!
     const startTime = performance.now();
-    for (let s = 0; s < generationSpeed; s++) {
-      const stepStart = performance.now();
-      hasMore = performStep(state);
-      timePerformStepRef.current += performance.now() - stepStart;
-      countPerformStepRef.current++;
+    try {
+      for (let s = 0; s < generationSpeed; s++) {
+        const stepStart = performance.now();
+        hasMore = performStep(state);
+        timePerformStepRef.current += performance.now() - stepStart;
+        countPerformStepRef.current++;
 
-      if (!hasMore) break;
+        if (!hasMore) break;
 
-      // Yield back to the browser's main thread if we exceed our 8ms frame budget
-      if (performance.now() - startTime > 8) {
-        break;
+        // Yield back to the browser's main thread if we exceed our 8ms frame budget
+        if (performance.now() - startTime > 8) {
+          break;
+        }
       }
+    } catch (err) {
+      // Gracefully exit the loop when an exception/validation error occurs.
+      // High-level state teardown, status update, and alert are already managed in the catch block of performStep.
+      return;
     }
 
     // Refresh UI parameters - Throttled to prevent React re-render flooding crashes
