@@ -33,7 +33,11 @@ interface GeneratorState {
   boardsChecked: number;
   validBoardsFound: number;
   uniqueCanonicalGrids: string[];
+  uniqueCanonicalGridsSet?: Set<string>;
   generatedBoards: BoardRecord[];
+  lastFoundUniqueGrid?: number[][];
+  lastFoundUniquePlacement?: number[];
+  hasNewUniqueFound?: boolean;
 }
 
 const PALETTE = [
@@ -41,6 +45,11 @@ const PALETTE = [
   "#fd79a8", "#2bcbba", "#ffeaa7", "#a4b0be", "#fa8231",
   "#4b7bec", "#2d98da", "#a55eea", "#f7b731", "#fc5c65"
 ];
+
+// Pre-allocated typed arrays to prevent garbage collection and memory leak crashes
+const visitedArr = new Uint8Array(121); // Max size 10x10 is 100, 121 is safe
+const queueR = new Int32Array(121);
+const queueC = new Int32Array(121);
 
 // Helper to check partial reachability for pruning
 function checkPartialReachability(grid: number[][], placement: number[]): boolean {
@@ -59,31 +68,83 @@ function checkPartialReachability(grid: number[][], placement: number[]): boolea
     
     if (assignedCount === 1) continue; // Just the seed
     
-    const visited = Array(N).fill(null).map(() => Array(N).fill(false));
-    visited[seedR][seedC] = true;
-    const queue: [number, number][] = [[seedR, seedC]];
+    // Clear visited state for N*N cells
+    const cellCount = N * N;
+    for (let i = 0; i < cellCount; i++) {
+      visitedArr[i] = 0;
+    }
+    
+    visitedArr[seedR * N + seedC] = 1;
+    queueR[0] = seedR;
+    queueC[0] = seedC;
     let visitedAssignedCount = 1;
     
     let head = 0;
-    while (head < queue.length) {
-      const [r, c] = queue[head++];
+    let tail = 1;
+    
+    while (head < tail) {
+      const r = queueR[head];
+      const c = queueC[head];
+      head++;
       
-      const neighbors = [
-        [r - 1, c],
-        [r + 1, c],
-        [r, c - 1],
-        [r, c + 1]
-      ];
-      
-      for (const [nr, nc] of neighbors) {
-        if (nr >= 0 && nr < N && nc >= 0 && nc < N) {
-          if (!visited[nr][nc]) {
-            const val = grid[nr][nc];
-            if (val === k || val === -1) {
-              visited[nr][nc] = true;
-              queue.push([nr, nc]);
-              if (val === k) visitedAssignedCount++;
-            }
+      // Checking 4-neighbors manually for ultimate performance and zero arrays allocation
+      // Up
+      if (r > 0) {
+        const nr = r - 1;
+        const idx = nr * N + c;
+        if (visitedArr[idx] === 0) {
+          const val = grid[nr][c];
+          if (val === k || val === -1) {
+            visitedArr[idx] = 1;
+            queueR[tail] = nr;
+            queueC[tail] = c;
+            tail++;
+            if (val === k) visitedAssignedCount++;
+          }
+        }
+      }
+      // Down
+      if (r < N - 1) {
+        const nr = r + 1;
+        const idx = nr * N + c;
+        if (visitedArr[idx] === 0) {
+          const val = grid[nr][c];
+          if (val === k || val === -1) {
+            visitedArr[idx] = 1;
+            queueR[tail] = nr;
+            queueC[tail] = c;
+            tail++;
+            if (val === k) visitedAssignedCount++;
+          }
+        }
+      }
+      // Left
+      if (c > 0) {
+        const nc = c - 1;
+        const idx = r * N + nc;
+        if (visitedArr[idx] === 0) {
+          const val = grid[r][nc];
+          if (val === k || val === -1) {
+            visitedArr[idx] = 1;
+            queueR[tail] = r;
+            queueC[tail] = nc;
+            tail++;
+            if (val === k) visitedAssignedCount++;
+          }
+        }
+      }
+      // Right
+      if (c < N - 1) {
+        const nc = c + 1;
+        const idx = r * N + nc;
+        if (visitedArr[idx] === 0) {
+          const val = grid[r][nc];
+          if (val === k || val === -1) {
+            visitedArr[idx] = 1;
+            queueR[tail] = r;
+            queueC[tail] = nc;
+            tail++;
+            if (val === k) visitedAssignedCount++;
           }
         }
       }
@@ -241,6 +302,11 @@ export default function GeneratorPortal() {
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
   const [stepsPerSec, setStepsPerSec] = useState<number>(0);
 
+  // Performance timings (last second averages in ms)
+  const [stepDuration, setStepDuration] = useState<number>(0);
+  const [reachabilityDuration, setReachabilityDuration] = useState<number>(0);
+  const [uniquenessDuration, setUniquenessDuration] = useState<number>(0);
+
   // Live Grid & Active Solution representation
   const [liveGrid, setLiveGrid] = useState<number[][]>([]);
   const [activeSolution, setActiveSolution] = useState<number[]>([]);
@@ -252,25 +318,43 @@ export default function GeneratorPortal() {
   const stepCountRef = useRef<number>(0);
   const lastSecRef = useRef<number>(Date.now());
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const lastUiUpdateRef = useRef<number>(0);
+
+  // High-performance timer accumulators
+  const timePerformStepRef = useRef<number>(0);
+  const timeReachabilityRef = useRef<number>(0);
+  const timeUniquenessRef = useRef<number>(0);
+  const countPerformStepRef = useRef<number>(0);
+  const countReachabilityRef = useRef<number>(0);
+  const countUniquenessRef = useRef<number>(0);
+
+  // Reusable Single AudioContext instance to prevent audio resource leaks
+  const audioCtxRef = useRef<AudioContext | null>(null);
 
   // Sound generator
   const playPulseSound = (freq = 600) => {
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       if (!AudioCtx) return;
-      const ctx = new AudioCtx();
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new AudioCtx();
+      }
+      const ctx = audioCtxRef.current;
+      if (ctx.state === "suspended") {
+        ctx.resume();
+      }
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "sine";
       osc.frequency.setValueAtTime(freq, ctx.currentTime);
-      gain.gain.setValueAtTime(0.02, ctx.currentTime);
+      gain.gain.setValueAtTime(0.015, ctx.currentTime);
       gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
       osc.connect(gain);
       gain.connect(ctx.destination);
       osc.start();
       osc.stop(ctx.currentTime + 0.08);
     } catch (e) {
-      // AudioContext blocked
+      // AudioContext blocked or not supported
     }
   };
 
@@ -288,6 +372,31 @@ export default function GeneratorPortal() {
         }
         stepCountRef.current = 0;
         lastSecRef.current = now;
+
+        // Compute performance averages over the last second
+        if (countPerformStepRef.current > 0) {
+          setStepDuration(timePerformStepRef.current / countPerformStepRef.current);
+        } else {
+          setStepDuration(0);
+        }
+        if (countReachabilityRef.current > 0) {
+          setReachabilityDuration(timeReachabilityRef.current / countReachabilityRef.current);
+        } else {
+          setReachabilityDuration(0);
+        }
+        if (countUniquenessRef.current > 0) {
+          setUniquenessDuration(timeUniquenessRef.current / countUniquenessRef.current);
+        } else {
+          setUniquenessDuration(0);
+        }
+
+        // Reset accumulators
+        timePerformStepRef.current = 0;
+        timeReachabilityRef.current = 0;
+        timeUniquenessRef.current = 0;
+        countPerformStepRef.current = 0;
+        countReachabilityRef.current = 0;
+        countUniquenessRef.current = 0;
       }, 1000);
     } else {
       if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
@@ -316,6 +425,7 @@ export default function GeneratorPortal() {
       boardsChecked: 0,
       validBoardsFound: 0,
       uniqueCanonicalGrids: [],
+      uniqueCanonicalGridsSet: new Set<string>(),
       generatedBoards: []
     };
 
@@ -332,6 +442,9 @@ export default function GeneratorPortal() {
     setRecentBoards([]);
     setElapsedSeconds(0);
     setStepsPerSec(0);
+    setStepDuration(0);
+    setReachabilityDuration(0);
+    setUniquenessDuration(0);
     stepCountRef.current = 0;
     lastSecRef.current = Date.now();
 
@@ -386,10 +499,18 @@ export default function GeneratorPortal() {
       state.boardsChecked = (state.boardsChecked || 0) + 1;
       
       // Solver verify uniqueness
+      const uniqStart = performance.now();
       const isUnique = isUniqueSolution(state.grid);
+      timeUniquenessRef.current += performance.now() - uniqStart;
+      countUniquenessRef.current++;
+
       if (isUnique) {
         const canonical = getUniqueRepresentative(state.grid);
-        if (!state.uniqueCanonicalGrids.includes(canonical)) {
+        if (!state.uniqueCanonicalGridsSet) {
+          state.uniqueCanonicalGridsSet = new Set<string>(state.uniqueCanonicalGrids);
+        }
+        if (!state.uniqueCanonicalGridsSet.has(canonical)) {
+          state.uniqueCanonicalGridsSet.add(canonical);
           state.uniqueCanonicalGrids.push(canonical);
           state.validBoardsFound = (state.validBoardsFound || 0) + 1;
           
@@ -405,6 +526,11 @@ export default function GeneratorPortal() {
           };
           
           state.generatedBoards.unshift(newRecord); // insert at start for recent view
+          
+          // Track unique board for high-performance direct paint
+          state.lastFoundUniqueGrid = state.grid.map(row => [...row]);
+          state.lastFoundUniquePlacement = [...placement];
+          state.hasNewUniqueFound = true;
           
           // Trigger win sound
           playPulseSound(1100);
@@ -463,7 +589,12 @@ export default function GeneratorPortal() {
       state.grid[r][c] = nextRegion;
 
       // Partial reachability pruning check
-      if (checkPartialReachability(state.grid, placement)) {
+      const reachStart = performance.now();
+      const isReachable = checkPartialReachability(state.grid, placement);
+      timeReachabilityRef.current += performance.now() - reachStart;
+      countReachabilityRef.current++;
+
+      if (isReachable) {
         state.cellIdx = cellIdx + 1;
         state.triedRegionsStack[state.cellIdx] = [];
       } else {
@@ -492,19 +623,46 @@ export default function GeneratorPortal() {
     const state = genStateRef.current;
     let hasMore = true;
 
-    // Perform multiple steps in a single loop tick for performance
+    // Perform multiple steps in a single loop tick for performance, but cap it to 8ms to prevent UI frame-drops!
+    const startTime = performance.now();
     for (let s = 0; s < generationSpeed; s++) {
+      const stepStart = performance.now();
       hasMore = performStep(state);
+      timePerformStepRef.current += performance.now() - stepStart;
+      countPerformStepRef.current++;
+
       if (!hasMore) break;
+
+      // Yield back to the browser's main thread if we exceed our 8ms frame budget
+      if (performance.now() - startTime > 8) {
+        break;
+      }
     }
 
-    // Refresh UI parameters
-    setBoardsChecked(state.boardsChecked);
-    setValidBoardsCount(state.validBoardsFound);
-    setCurrentPlacementIdx(state.placementIdx);
-    setLiveGrid(state.grid.map(row => [...row]));
-    setActiveSolution(state.placements[state.placementIdx] || []);
-    setRecentBoards([...state.generatedBoards.slice(0, 8)]);
+    // Refresh UI parameters - Throttled to prevent React re-render flooding crashes
+    const now = Date.now();
+    const shouldForceUpdate = !hasMore || state.hasNewUniqueFound;
+    if (now - lastUiUpdateRef.current > 150 || shouldForceUpdate) {
+      lastUiUpdateRef.current = now;
+      setBoardsChecked(state.boardsChecked);
+      setValidBoardsCount(state.validBoardsFound);
+      setCurrentPlacementIdx(state.placementIdx);
+      
+      // Update the visual grid only when a unique puzzle is discovered OR upon completion,
+      // which completely eliminates rendering lag and provides a satisfying reveal!
+      if (state.lastFoundUniqueGrid) {
+        setLiveGrid(state.lastFoundUniqueGrid.map(row => [...row]));
+        if (state.lastFoundUniquePlacement) {
+          setActiveSolution([...state.lastFoundUniquePlacement]);
+        }
+        state.hasNewUniqueFound = false; // reset flag
+      } else if (!hasMore) {
+        setLiveGrid(state.grid.map(row => [...row]));
+        setActiveSolution(state.placements[state.placementIdx] || []);
+      }
+      
+      setRecentBoards([...state.generatedBoards.slice(0, 8)]);
+    }
 
     if (hasMore) {
       requestAnimationFrame(generatorLoop);
@@ -536,6 +694,14 @@ export default function GeneratorPortal() {
     setIsRunning(false);
     isRunningRef.current = false;
     setStatus("paused");
+    
+    // Show current search path state immediately on stop
+    const state = genStateRef.current;
+    if (state) {
+      setLiveGrid(state.grid.map(row => [...row]));
+      setActiveSolution(state.placements[state.placementIdx] || []);
+    }
+    
     showAlert("Generator stopped. Current search path preserved.", "info");
     playPulseSound(500);
   };
@@ -563,22 +729,40 @@ export default function GeneratorPortal() {
       return;
     }
 
-    let csvContent = "data:text/csv;charset=utf-8,";
-    csvContent += "id,size,grid,solution\n";
-    
+    let csvContentText = "id,size,grid,solution\n";
     state.generatedBoards.forEach(b => {
       // Escape strings in double quotes
-      csvContent += `${b.id},${b.size},"${b.grid}","${b.solution}"\n`;
+      csvContentText += `${b.id},${b.size},"${b.grid}","${b.solution}"\n`;
     });
 
+    const csvContent = "data:text/csv;charset=utf-8," + csvContentText;
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement("a");
     link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `queens_puzzles_n${boardSize}.csv`);
+    const filename = `queens_puzzles_n${boardSize}.csv`;
+    link.setAttribute("download", filename);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    showAlert("CSV downloaded successfully!", "success");
+    
+    // Save to server assets folder automatically
+    fetch("/api/save-asset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename, content: csvContentText })
+    })
+    .then(res => res.json())
+    .then(data => {
+      if (data.success) {
+        showAlert(`CSV downloaded locally & saved to assets: ${filename}`, "success");
+      } else {
+        showAlert("CSV downloaded locally.", "success");
+      }
+    })
+    .catch(err => {
+      console.error("Failed to save asset:", err);
+      showAlert("CSV downloaded locally.", "success");
+    });
   };
 
   const handleDownloadResumeFile = () => {
@@ -605,11 +789,30 @@ export default function GeneratorPortal() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.setAttribute("href", url);
-    link.setAttribute("download", `queens_resume_n${boardSize}_step_${state.boardsChecked}.json`);
+    const filename = `queens_resume_n${boardSize}_step_${state.boardsChecked}.json`;
+    link.setAttribute("download", filename);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    showAlert("Resume file JSON saved!", "success");
+
+    // Save to server assets folder automatically
+    fetch("/api/save-asset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename, content: payload })
+    })
+    .then(res => res.json())
+    .then(data => {
+      if (data.success) {
+        showAlert(`Resume file JSON saved to assets: ${filename}`, "success");
+      } else {
+        showAlert("Resume file JSON saved locally!", "success");
+      }
+    })
+    .catch(err => {
+      console.error("Failed to save resume asset:", err);
+      showAlert("Resume file JSON saved locally!", "success");
+    });
   };
 
   // Import / Resume logic
@@ -639,6 +842,7 @@ export default function GeneratorPortal() {
           boardsChecked: data.boardsChecked || 0,
           validBoardsFound: data.validBoardsFound || 0,
           uniqueCanonicalGrids: data.uniqueCanonicalGrids || [],
+          uniqueCanonicalGridsSet: new Set<string>(data.uniqueCanonicalGrids || []),
           generatedBoards: data.generatedBoards
         };
 
@@ -814,6 +1018,24 @@ export default function GeneratorPortal() {
                   <span className="text-[10px] font-black text-[#0984e3]">
                     {stepsPerSec.toLocaleString()} steps/s
                   </span>
+                </div>
+              </div>
+
+              <div className="bg-[#f1f2f6] p-2.5 rounded-xl border-2 border-[#2d3436] col-span-2">
+                <span className="text-[9px] font-black uppercase text-[#636e72] block">Profiler Timings (Last Sec Avg)</span>
+                <div className="flex flex-col gap-1 mt-1 text-[10px]">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[#636e72] font-semibold">performStep():</span>
+                    <span className="font-bold text-[#2d3436]">{stepDuration > 0 ? `${stepDuration.toFixed(4)} ms` : "0.0000 ms"}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-[#636e72] font-semibold">reachabilityPrune():</span>
+                    <span className="font-bold text-[#2d3436]">{reachabilityDuration > 0 ? `${reachabilityDuration.toFixed(4)} ms` : "0.0000 ms"}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-[#636e72] font-semibold">isUniqueSolution():</span>
+                    <span className="font-bold text-[#2d3436]">{uniquenessDuration > 0 ? `${uniquenessDuration.toFixed(4)} ms` : "0.0000 ms"}</span>
+                  </div>
                 </div>
               </div>
             </div>

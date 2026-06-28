@@ -1,5 +1,6 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import dotenv from "dotenv";
 import { MongoClient } from "mongodb";
 import { createServer as createViteServer } from "vite";
@@ -11,29 +12,153 @@ const PORT = 3000;
 const app = express();
 app.use(express.json());
 
-// MongoDB URI matching existing workspace connection string
-const mongoUri = process.env.MONGODB_URI || "mongodb+srv://agent:aromal@queens-dev.u1uyh5l.mongodb.net/?appName=Queens-Dev";
+// MongoDB URI verification and fallback setup
+let mongoUri = process.env.MONGODB_URI || "";
+const isValidUri = (uri: string): boolean => {
+  const trimmed = uri.trim();
+  return trimmed.startsWith("mongodb://") || trimmed.startsWith("mongodb+srv://");
+};
+
+const DEFAULT_FALLBACK_URI = "mongodb+srv://agent:aromal@queens-dev.u1uyh5l.mongodb.net/?appName=Queens-Dev";
+let isMongoConfigured = true;
+
+if (!isValidUri(mongoUri)) {
+  if (mongoUri && mongoUri.trim() !== "") {
+    console.warn(`[Admin Service] Configured MONGODB_URI is invalid: "${mongoUri}". Falling back to default URI.`);
+  }
+  mongoUri = DEFAULT_FALLBACK_URI;
+}
+
+if (!isValidUri(mongoUri)) {
+  console.error("[Admin Service] No valid MongoDB URI found. Local fallback storage will be used.");
+  isMongoConfigured = false;
+}
+
 const dbName = "queens-dev";
 const collectionName = "levels";
 
+// Define a local database file to persist levels if MongoDB is not available
+const LOCAL_DB_PATH = path.join(process.cwd(), "custom_levels.json");
+
+// In-memory cache of levels for immediate access
+let localLevels: any[] = [];
+
+// Load initial local levels from file if it exists
+try {
+  if (fs.existsSync(LOCAL_DB_PATH)) {
+    const fileContent = fs.readFileSync(LOCAL_DB_PATH, "utf8");
+    localLevels = JSON.parse(fileContent);
+    console.log(`[Admin Service] Loaded ${localLevels.length} custom boards from local JSON storage.`);
+  }
+} catch (e) {
+  console.error("[Admin Service] Failed to load local levels file:", e);
+}
+
+function saveLocalLevels() {
+  try {
+    fs.writeFileSync(LOCAL_DB_PATH, JSON.stringify(localLevels, null, 2), "utf8");
+  } catch (e) {
+    console.error("[Admin Service] Failed to save local levels file:", e);
+  }
+}
+
+// A simple mock matching the subset of MongoDB collection methods used in this application
+class LocalCollectionMock {
+  find() {
+    return {
+      toArray: async () => {
+        return JSON.parse(JSON.stringify(localLevels));
+      }
+    };
+  }
+
+  async updateOne(filter: { id: string }, update: { $set: any }, options?: { upsert?: boolean }) {
+    const id = filter.id;
+    const payload = update.$set || {};
+    const existingIndex = localLevels.findIndex(item => item.id === id);
+    
+    if (existingIndex !== -1) {
+      localLevels[existingIndex] = { ...localLevels[existingIndex], ...payload, id };
+    } else if (options?.upsert) {
+      localLevels.push({ ...payload, id });
+    } else {
+      return { matchedCount: 0, modifiedCount: 0 };
+    }
+    
+    saveLocalLevels();
+    return { matchedCount: 1, modifiedCount: 1, upsertedCount: existingIndex === -1 ? 1 : 0 };
+  }
+
+  async deleteOne(filter: { id: string }) {
+    const id = filter.id;
+    const initialLen = localLevels.length;
+    localLevels = localLevels.filter(item => item.id !== id);
+    saveLocalLevels();
+    return { deletedCount: initialLen - localLevels.length };
+  }
+}
+
+class LocalDbMock {
+  collection(_name: string) {
+    return new LocalCollectionMock();
+  }
+}
+
+const localDbMockInstance = new LocalDbMock();
+let useLocalFallback = !isMongoConfigured;
 let mongoClient: MongoClient | null = null;
 
 async function getDb() {
+  if (useLocalFallback) {
+    return localDbMockInstance as any;
+  }
+
   if (!mongoClient) {
     try {
+      console.log("[Admin Service] Connecting to MongoDB...");
       mongoClient = new MongoClient(mongoUri, {
-        connectTimeoutMS: 5000,
+        connectTimeoutMS: 4000,
         socketTimeoutMS: 30000,
       });
       await mongoClient.connect();
       console.log("[Admin Service] Connected to MongoDB Atlas successfully");
-    } catch (err) {
-      console.error("[Admin Service] MongoDB Connection error:", err);
+    } catch (err: any) {
+      console.error("[Admin Service] MongoDB Connection failed. Switching to local fallback storage. Error:", err?.message || err);
       mongoClient = null;
-      throw err;
+      useLocalFallback = true;
+      return localDbMockInstance as any;
     }
   }
-  return mongoClient.db(dbName);
+  
+  try {
+    return mongoClient.db(dbName);
+  } catch (err: any) {
+    console.error("[Admin Service] MongoDB selection failed. Switching to local fallback storage. Error:", err?.message || err);
+    useLocalFallback = true;
+    return localDbMockInstance as any;
+  }
+}
+
+// Resilient database operation wrapper to gracefully catch and handle runtime connection/SSL errors
+async function executeDbQuery<T>(fn: (db: any) => Promise<T>): Promise<T> {
+  const db = await getDb();
+  try {
+    return await fn(db);
+  } catch (err: any) {
+    if (!useLocalFallback) {
+      console.error("[Admin Service] Database operation failed. Forcing local fallback and retrying...", err?.message || err);
+      useLocalFallback = true;
+      if (mongoClient) {
+        try {
+          await mongoClient.close();
+        } catch (e) {}
+        mongoClient = null;
+      }
+      const fallbackDb = await getDb();
+      return await fn(fallbackDb);
+    }
+    throw err;
+  }
 }
 
 // Help parse difficulty dynamically via string slicing
@@ -68,12 +193,45 @@ function mapDbLevelToClient(level: any) {
 // API: List custom boards
 app.get("/api/boards", async (_req, res) => {
   try {
-    const db = await getDb();
-    const boards = await db.collection(collectionName).find({}).toArray();
+    const boards = await executeDbQuery(async (db) => {
+      return await db.collection(collectionName).find({}).toArray();
+    });
     res.json(boards.map(mapDbLevelToClient));
   } catch (err: any) {
     console.error("Error retrieving boards:", err);
     res.status(500).json({ error: "Failed to retrieve boards", details: err?.message });
+  }
+});
+
+// API: Save file to assets directory
+app.post("/api/save-asset", async (req, res) => {
+  try {
+    const { filename, content } = req.body;
+    if (!filename || content === undefined) {
+      return res.status(400).json({ error: "Missing filename or content" });
+    }
+
+    // Only allow alphanumeric characters, dots, underscores, and dashes
+    const safeFilename = filename.replace(/[^a-zA-Z0-9._-]/g, "");
+    if (!safeFilename) {
+      return res.status(400).json({ error: "Invalid filename" });
+    }
+
+    const assetsDir = path.join(process.cwd(), "src", "assets");
+    
+    // Ensure src/assets exists
+    if (!fs.existsSync(assetsDir)) {
+      fs.mkdirSync(assetsDir, { recursive: true });
+    }
+
+    const filePath = path.join(assetsDir, safeFilename);
+    fs.writeFileSync(filePath, content, "utf8");
+
+    console.log(`[Admin Service] Saved asset: ${safeFilename}`);
+    res.json({ success: true, path: `/src/assets/${safeFilename}` });
+  } catch (err: any) {
+    console.error("Failed to save asset:", err);
+    res.status(500).json({ error: "Failed to save asset", details: err?.message });
   }
 });
 
@@ -83,11 +241,12 @@ app.post("/api/sync", async (req, res) => {
     const { clientLevels } = req.body;
     const clientLevelsList = Array.isArray(clientLevels) ? clientLevels : [];
     
-    const db = await getDb();
-    const dbLevels = await db.collection(collectionName).find({}).toArray();
+    const dbLevels = await executeDbQuery(async (db) => {
+      return await db.collection(collectionName).find({}).toArray();
+    });
 
     const dbLevelsMap = new Map<string, any>();
-    dbLevels.forEach((level) => {
+    dbLevels.forEach((level: any) => {
       const cleanLevel = mapDbLevelToClient(level);
       dbLevelsMap.set(level.id, cleanLevel);
     });
@@ -136,12 +295,13 @@ app.post("/api/boards", async (req, res) => {
     board.updatedAt = Date.now();
     const dbPayload = cleanLevelForDb(board);
 
-    const db = await getDb();
-    await db.collection(collectionName).updateOne(
-      { id: board.id },
-      { $set: dbPayload },
-      { upsert: true }
-    );
+    await executeDbQuery(async (db) => {
+      return await db.collection(collectionName).updateOne(
+        { id: board.id },
+        { $set: dbPayload },
+        { upsert: true }
+      );
+    });
 
     res.status(201).json({ success: true, board: mapDbLevelToClient(dbPayload) });
   } catch (err: any) {
@@ -159,11 +319,12 @@ app.put("/api/boards/:id", async (req, res) => {
     updates.updatedAt = Date.now();
     const dbPayload = cleanLevelForDb(updates);
 
-    const db = await getDb();
-    const result = await db.collection(collectionName).updateOne(
-      { id },
-      { $set: dbPayload }
-    );
+    const result = await executeDbQuery(async (db) => {
+      return await db.collection(collectionName).updateOne(
+        { id },
+        { $set: dbPayload }
+      );
+    });
 
     if (result.matchedCount === 0) {
       return res.status(404).json({ error: "Board not found" });
@@ -180,8 +341,9 @@ app.put("/api/boards/:id", async (req, res) => {
 app.delete("/api/boards/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const db = await getDb();
-    const result = await db.collection(collectionName).deleteOne({ id });
+    const result = await executeDbQuery(async (db) => {
+      return await db.collection(collectionName).deleteOne({ id });
+    });
 
     if (result.deletedCount === 0) {
       return res.status(404).json({ error: "Board not found" });
