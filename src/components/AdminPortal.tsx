@@ -62,8 +62,8 @@ export default function AdminPortal({ onClose: _onClose, allBoards, onSaveBoards
 
   const handleLoginSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const envUser = (import.meta as any).env?.VITE_ADMIN_USERNAME || "admin";
-    const envPass = (import.meta as any).env?.VITE_ADMIN_PASSWORD || "1234";
+    const envUser = import.meta.env.VITE_ADMIN_USERNAME || "admin";
+    const envPass = import.meta.env.VITE_ADMIN_PASSWORD || "1234";
     if (username === envUser && password === envPass) {
       setIsLoggedIn(true);
       setLoginError(false);
