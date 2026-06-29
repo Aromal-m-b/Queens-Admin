@@ -38,6 +38,7 @@ interface GeneratorState {
   lastFoundUniqueGrid?: number[][];
   lastFoundUniquePlacement?: number[];
   hasNewUniqueFound?: boolean;
+  generationMode?: "single" | "all";
 }
 
 const PALETTE = [
@@ -315,6 +316,10 @@ function validateState(state: GeneratorState): void {
     throw new Error("state.cellsToAssign is not an array.");
   }
   const cellIdx = state.cellIdx;
+  if (cellIdx === -1) {
+    // Legitimate backtracking state when transitioning between placements
+    return;
+  }
   if (typeof cellIdx !== "number" || cellIdx < 0 || cellIdx > cells.length) {
     throw new Error(`cellIdx out of bounds: cellIdx = ${cellIdx}, cellsToAssign.length = ${cells.length}`);
   }
@@ -378,6 +383,9 @@ export default function GeneratorPortal() {
   const [liveGrid, setLiveGrid] = useState<number[][]>([]);
   const [activeSolution, setActiveSolution] = useState<number[]>([]);
   const [recentBoards, setRecentBoards] = useState<BoardRecord[]>([]);
+  const [selectedPlacementIdx, setSelectedPlacementIdx] = useState<number>(0);
+  const [generationMode, setGenerationMode] = useState<"single" | "all">("all");
+  const [allGeneratedBoards, setAllGeneratedBoards] = useState<BoardRecord[]>([]);
 
   // Generator internal state reference
   const genStateRef = useRef<GeneratorState | null>(null);
@@ -474,17 +482,21 @@ export default function GeneratorPortal() {
   }, [isRunning]);
 
   // Clean initialization of generator state
-  const initializeState = (N: number) => {
+  const initializeState = (N: number, targetPlacementIdx?: number, targetMode?: "single" | "all") => {
     const placements = generateQueenPlacements(N);
     if (placements.length === 0) {
-      showAlert(`No valid Queen placements found for size ${N}!`, "error");
-      return null;
+       showAlert(`No valid Queen placements found for size ${N}!`, "error");
+       return null;
     }
+
+    const mode = targetMode !== undefined ? targetMode : generationMode;
+    const pIdx = targetPlacementIdx !== undefined ? targetPlacementIdx : selectedPlacementIdx;
+    const safeIdx = pIdx >= 0 && pIdx < placements.length ? pIdx : 0;
 
     const state: GeneratorState = {
       N,
       placements,
-      placementIdx: 0,
+      placementIdx: safeIdx,
       cellsToAssign: [],
       cellIdx: 0,
       grid: [],
@@ -493,20 +505,22 @@ export default function GeneratorPortal() {
       validBoardsFound: 0,
       uniqueCanonicalGrids: [],
       uniqueCanonicalGridsSet: new Set<string>(),
-      generatedBoards: []
+      generatedBoards: [],
+      generationMode: mode
     };
 
-    // Populate initial configuration for first placement
+    // Populate initial configuration for safeIdx placement
     initializePlacementState(state);
     
     genStateRef.current = state;
     setBoardsChecked(0);
     setValidBoardsCount(0);
-    setCurrentPlacementIdx(0);
+    setCurrentPlacementIdx(safeIdx);
     setTotalPlacements(placements.length);
     setLiveGrid(state.grid.map(row => [...row]));
-    setActiveSolution(placements[0]);
+    setActiveSolution(placements[safeIdx]);
     setRecentBoards([]);
+    setAllGeneratedBoards([]);
     setElapsedSeconds(0);
     setStepsPerSec(0);
     setStepDuration(0);
@@ -676,6 +690,9 @@ export default function GeneratorPortal() {
         state.cellIdx = cellIdx - 1;
 
         if (state.cellIdx < 0) {
+          if (state.generationMode === "single") {
+            return false; // Done with this specific level!
+          }
           state.placementIdx++;
           if (state.placementIdx < state.placements.length) {
             initializePlacementState(state);
@@ -764,6 +781,7 @@ export default function GeneratorPortal() {
       }
       
       setRecentBoards([...state.generatedBoards.slice(0, 8)]);
+      setAllGeneratedBoards([...state.generatedBoards]);
     }
 
     if (hasMore) {
@@ -772,7 +790,11 @@ export default function GeneratorPortal() {
       setIsRunning(false);
       isRunningRef.current = false;
       setStatus("completed");
-      showAlert("Puzzle Generation Completed! All configurations successfully exhausted.", "success");
+      if (state.generationMode === "single") {
+        showAlert(`Completed generating boards for Level ${state.placementIdx + 1}!`, "success");
+      } else {
+        showAlert("Puzzle Generation Completed! All configurations successfully exhausted.", "success");
+      }
       playPulseSound(1500);
     }
   };
@@ -780,7 +802,9 @@ export default function GeneratorPortal() {
   const handleStart = () => {
     let state = genStateRef.current;
     if (!state) {
-      state = initializeState(boardSize);
+      state = initializeState(boardSize, selectedPlacementIdx, generationMode);
+    } else {
+      state.generationMode = generationMode;
     }
     if (!state) return;
 
@@ -812,15 +836,35 @@ export default function GeneratorPortal() {
     setIsRunning(false);
     isRunningRef.current = false;
     setStatus("idle");
-    initializeState(boardSize);
+    initializeState(boardSize, selectedPlacementIdx, generationMode);
     showAlert("Generator reset.", "info");
   };
 
   const handleSizeChange = (newSize: number) => {
     if (isRunning) return;
     setBoardSize(newSize);
-    initializeState(newSize);
+    setSelectedPlacementIdx(0);
+    initializeState(newSize, 0, generationMode);
     showAlert(`Board size set to ${newSize}x${newSize}`, "info");
+  };
+
+  const handleSelectLevel = (idx: number) => {
+    if (isRunning) {
+      showAlert("Stop the generator before changing levels!", "error");
+      return;
+    }
+    setSelectedPlacementIdx(idx);
+    initializeState(boardSize, idx, generationMode);
+    showAlert(`Selected Level ${idx + 1} for board size ${boardSize}x${boardSize}`, "info");
+  };
+
+  const handleSetGenerationMode = (mode: "single" | "all") => {
+    if (isRunning) return;
+    setGenerationMode(mode);
+    const state = genStateRef.current;
+    if (state) {
+      state.generationMode = mode;
+    }
   };
 
   // Export functions
@@ -973,6 +1017,7 @@ export default function GeneratorPortal() {
         setLiveGrid(state.grid.map(row => [...row]));
         setActiveSolution(placements[state.placementIdx] || []);
         setRecentBoards([...state.generatedBoards.slice(0, 8)]);
+        setAllGeneratedBoards([...state.generatedBoards]);
         setElapsedSeconds(data.elapsedSeconds || 0);
         setStatus("paused");
 
@@ -984,6 +1029,16 @@ export default function GeneratorPortal() {
     };
     reader.readAsText(file);
   };
+
+  const placements = React.useMemo(() => generateQueenPlacements(boardSize), [boardSize]);
+
+  const levelBoardCounts = React.useMemo(() => {
+    const counts: Record<string, number> = {};
+    allGeneratedBoards.forEach(b => {
+      counts[b.solution] = (counts[b.solution] || 0) + 1;
+    });
+    return counts;
+  }, [allGeneratedBoards]);
 
   return (
     <div className="w-full max-w-6xl mx-auto flex flex-col items-stretch gap-6 select-none text-[#2d3436]">
@@ -1247,63 +1302,143 @@ export default function GeneratorPortal() {
           </div>
         </div>
 
-        {/* Right column: Export / Import file deck */}
+        {/* Right column: Levels & Files */}
         <div className="lg:col-span-3 bg-white border-4 border-[#2d3436] rounded-3xl p-5 shadow-[6px_6px_0px_#2d3436] flex flex-col gap-5">
-          <div>
+          {/* Queen Levels Panel */}
+          <div className="pb-4 border-b-2 border-[#f1f2f6]">
             <h3 className="font-display font-black text-lg tracking-tight mb-1 flex items-center gap-1.5 text-[#2d3436]">
-              <Download className="w-5 h-5 text-[#00b894]" />
+              👑 QUEEN LEVELS ({placements.length})
+            </h3>
+            <p className="text-[10px] text-[#b2bec3] font-bold uppercase tracking-wider mb-3">Unique Solutions as Levels</p>
+
+            {/* Mode Selector Pill Toggle */}
+            <div className="grid grid-cols-2 gap-1 bg-[#f1f2f6] p-1 border-2 border-[#2d3436] rounded-xl mb-3">
+              <button
+                disabled={isRunning}
+                onClick={() => handleSetGenerationMode("single")}
+                className={`py-1 text-[10px] font-black uppercase tracking-wider rounded-lg transition-all border ${
+                  generationMode === "single"
+                    ? "bg-[#6c5ce7] text-white border-[#2d3436]"
+                    : "bg-white text-[#2d3436] border-transparent hover:border-[#b2bec3]/40 disabled:opacity-50 cursor-pointer"
+                }`}
+              >
+                Single Level
+              </button>
+              <button
+                disabled={isRunning}
+                onClick={() => handleSetGenerationMode("all")}
+                className={`py-1 text-[10px] font-black uppercase tracking-wider rounded-lg transition-all border ${
+                  generationMode === "all"
+                    ? "bg-[#6c5ce7] text-white border-[#2d3436]"
+                    : "bg-white text-[#2d3436] border-transparent hover:border-[#b2bec3]/40 disabled:opacity-50 cursor-pointer"
+                }`}
+              >
+                All Levels
+              </button>
+            </div>
+
+            {/* Scrollable Levels Grid */}
+            <div className="border-2 border-[#2d3436] rounded-xl bg-[#f1f2f6] p-1.5 max-h-[170px] overflow-y-auto pr-1.5">
+              <div className="grid grid-cols-4 gap-1">
+                {placements.map((p, idx) => {
+                  const active = selectedPlacementIdx === idx;
+                  const solStr = p.map((col, r) => `${r}-${col}`).join(";");
+                  const count = levelBoardCounts[solStr] || 0;
+                  
+                  return (
+                    <button
+                      key={idx}
+                      disabled={isRunning}
+                      onClick={() => handleSelectLevel(idx)}
+                      className={`relative aspect-square flex flex-col items-center justify-center rounded-lg border-2 text-[10px] font-mono font-black transition-all ${
+                        active
+                          ? "bg-[#6c5ce7] text-white border-[#2d3436] shadow-sm scale-95"
+                          : "bg-white text-[#2d3436] border-transparent hover:border-[#b2bec3]/40 disabled:opacity-50 cursor-pointer"
+                      }`}
+                      title={`Placement: ${p.map((c, r) => `(${r},${c})`).join(" ")}`}
+                    >
+                      <span className="text-[8px] uppercase tracking-tighter">Lvl</span>
+                      <span className="text-xs leading-none">{idx + 1}</span>
+
+                      {/* Boards Count Badge if any generated */}
+                      {count > 0 && (
+                        <span className="absolute top-[-3px] right-[-3px] bg-[#00b894] text-white text-[8px] font-sans font-extrabold px-1 min-w-[12px] h-[12px] flex items-center justify-center rounded-full border border-white">
+                          {count}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Selected Level Info */}
+            <div className="mt-3 bg-[#f1f2f6] border-2 border-[#2d3436] p-2 rounded-xl font-mono text-[9px] text-[#2d3436]">
+              <span className="block font-black text-[10px] text-[#6c5ce7] mb-0.5">
+                Selected: Level {selectedPlacementIdx + 1}
+              </span>
+              <span className="block text-[#636e72] break-all leading-tight">
+                Queens: {placements[selectedPlacementIdx]?.map((col, r) => `(${r},${col})`).join(" ")}
+              </span>
+            </div>
+          </div>
+
+          {/* Files section */}
+          <div>
+            <h3 className="font-display font-black text-base tracking-tight mb-1 flex items-center gap-1.5 text-[#2d3436]">
+              <Download className="w-4 h-4 text-[#00b894]" />
               FILES & RECON
             </h3>
-            <p className="text-[10px] text-[#b2bec3] font-bold uppercase tracking-wider">Save, Restore & Export</p>
-          </div>
+            <p className="text-[10px] text-[#b2bec3] font-bold uppercase tracking-wider mb-3">Save, Restore & Export</p>
 
-          {/* Action cards to download csv & resume file */}
-          <div className="flex flex-col gap-3">
-            <button
-              onClick={handleDownloadCSV}
-              disabled={validBoardsCount === 0}
-              className="w-full flex items-center justify-between p-3 border-2 border-[#2d3436] rounded-2xl bg-[#55efc4]/10 text-[#00b894] font-black hover:bg-[#55efc4]/20 transition-all shadow-[2px_2px_0px_#2d3436] hover:translate-y-[-1px] disabled:opacity-40 disabled:cursor-not-allowed text-xs focus:outline-none cursor-pointer"
-            >
-              <div className="flex items-center gap-2 text-left">
-                <Download className="w-4 h-4" />
-                <div>
-                  <span className="block font-bold">Download Generated CSV</span>
-                  <span className="block text-[9px] text-[#b2bec3] font-semibold">Puzzles ready to import</span>
+            {/* Action cards to download csv & resume file */}
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={handleDownloadCSV}
+                disabled={validBoardsCount === 0}
+                className="w-full flex items-center justify-between p-2.5 border-2 border-[#2d3436] rounded-xl bg-[#55efc4]/10 text-[#00b894] font-black hover:bg-[#55efc4]/20 transition-all shadow-[2px_2px_0px_#2d3436] hover:translate-y-[-1px] disabled:opacity-40 disabled:cursor-not-allowed text-[10px] focus:outline-none cursor-pointer"
+              >
+                <div className="flex items-center gap-2 text-left">
+                  <Download className="w-3.5 h-3.5" />
+                  <div>
+                    <span className="block font-bold">Download Generated CSV</span>
+                    <span className="block text-[8px] text-[#b2bec3] font-semibold">Puzzles ready to import</span>
+                  </div>
                 </div>
-              </div>
-            </button>
+              </button>
 
-            <button
-              onClick={handleDownloadResumeFile}
-              disabled={boardsChecked === 0}
-              className="w-full flex items-center justify-between p-3 border-2 border-[#2d3436] rounded-2xl bg-[#74b9ff]/10 text-[#0984e3] font-black hover:bg-[#74b9ff]/20 transition-all shadow-[2px_2px_0px_#2d3436] hover:translate-y-[-1px] disabled:opacity-40 disabled:cursor-not-allowed text-xs focus:outline-none cursor-pointer"
-            >
-              <div className="flex items-center gap-2 text-left">
-                <Download className="w-4 h-4" />
-                <div>
-                  <span className="block font-bold">Download Resume State</span>
-                  <span className="block text-[9px] text-[#b2bec3] font-semibold">Checkpoint .JSON file</span>
+              <button
+                onClick={handleDownloadResumeFile}
+                disabled={boardsChecked === 0}
+                className="w-full flex items-center justify-between p-2.5 border-2 border-[#2d3436] rounded-xl bg-[#74b9ff]/10 text-[#0984e3] font-black hover:bg-[#74b9ff]/20 transition-all shadow-[2px_2px_0px_#2d3436] hover:translate-y-[-1px] disabled:opacity-40 disabled:cursor-not-allowed text-[10px] focus:outline-none cursor-pointer"
+              >
+                <div className="flex items-center gap-2 text-left">
+                  <Download className="w-3.5 h-3.5" />
+                  <div>
+                    <span className="block font-bold">Download Resume State</span>
+                    <span className="block text-[8px] text-[#b2bec3] font-semibold">Checkpoint .JSON file</span>
+                  </div>
                 </div>
-              </div>
-            </button>
-          </div>
+              </button>
+            </div>
 
-          {/* Upload card */}
-          <div className="border-t-2 border-[#f1f2f6] pt-4 mt-2">
-            <span className="block text-[10px] font-mono font-black text-[#636e72] uppercase tracking-wider mb-2">
-              Restore / Resume session
-            </span>
-            <label className="w-full flex flex-col items-center justify-center p-3 border-2 border-dashed border-[#b2bec3] hover:border-[#2d3436] bg-[#f1f2f6]/40 rounded-2xl cursor-pointer transition-all">
-              <Upload className="w-5 h-5 text-[#b2bec3] mb-1" />
-              <span className="text-xs font-bold text-[#636e72]">Upload Resume File</span>
-              <span className="text-[9px] text-[#b2bec3] font-medium mt-0.5">(.json checkpoint)</span>
-              <input
-                type="file"
-                accept=".json"
-                onChange={handleUploadResumeFile}
-                className="hidden"
-              />
-            </label>
+            {/* Upload card */}
+            <div className="border-t-2 border-[#f1f2f6] pt-3 mt-3">
+              <span className="block text-[9px] font-mono font-black text-[#636e72] uppercase tracking-wider mb-1.5">
+                Restore / Resume session
+              </span>
+              <label className="w-full flex flex-col items-center justify-center p-2.5 border-2 border-dashed border-[#b2bec3] hover:border-[#2d3436] bg-[#f1f2f6]/40 rounded-xl cursor-pointer transition-all">
+                <Upload className="w-4 h-4 text-[#b2bec3] mb-0.5" />
+                <span className="text-[10px] font-bold text-[#636e72]">Upload Resume File</span>
+                <span className="text-[8px] text-[#b2bec3] font-medium mt-0.5">(.json checkpoint)</span>
+                <input
+                  type="file"
+                  accept=".json"
+                  onChange={handleUploadResumeFile}
+                  className="hidden"
+                />
+              </label>
+            </div>
           </div>
         </div>
 

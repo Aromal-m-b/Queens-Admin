@@ -16,25 +16,21 @@ app.use(express.json());
 let mongoUri = process.env.MONGODB_URI || "";
 const isValidUri = (uri: string): boolean => {
   const trimmed = uri.trim();
-  return trimmed.startsWith("mongodb://") || trimmed.startsWith("mongodb+srv://");
+  return (trimmed.startsWith("mongodb://") || trimmed.startsWith("mongodb+srv://")) && trimmed !== "your_mongodb_connection_string_here";
 };
 
-const DEFAULT_FALLBACK_URI = "mongodb+srv://agent:aromal@queens-dev.u1uyh5l.mongodb.net/?appName=Queens-Dev";
 let isMongoConfigured = true;
 
 if (!isValidUri(mongoUri)) {
-  if (mongoUri && mongoUri.trim() !== "") {
-    console.warn(`[Admin Service] Configured MONGODB_URI is invalid: "${mongoUri}". Falling back to default URI.`);
+  if (mongoUri && mongoUri.trim() !== "" && mongoUri !== "your_mongodb_connection_string_here") {
+    console.warn(`[Admin Service] Configured MONGODB_URI is invalid: "${mongoUri}". Local fallback storage will be used.`);
+  } else {
+    console.info("[Admin Service] No valid MONGODB_URI provided in the environment. Local fallback storage will be used.");
   }
-  mongoUri = DEFAULT_FALLBACK_URI;
-}
-
-if (!isValidUri(mongoUri)) {
-  console.error("[Admin Service] No valid MongoDB URI found. Local fallback storage will be used.");
   isMongoConfigured = false;
 }
 
-const dbName = "queens-dev";
+const dbName = process.env.MONGODB_DB_NAME || "queens-dev";
 const collectionName = "levels";
 
 // Define a local database file to persist levels if MongoDB is not available
@@ -107,36 +103,61 @@ class LocalDbMock {
 const localDbMockInstance = new LocalDbMock();
 let useLocalFallback = !isMongoConfigured;
 let mongoClient: MongoClient | null = null;
+let connectionPromise: Promise<MongoClient | null> | null = null;
 
 async function getDb() {
   if (useLocalFallback) {
     return localDbMockInstance as any;
   }
 
-  if (!mongoClient) {
+  if (mongoClient) {
     try {
-      console.log("[Admin Service] Connecting to MongoDB...");
-      mongoClient = new MongoClient(mongoUri, {
-        connectTimeoutMS: 4000,
-        socketTimeoutMS: 30000,
-      });
-      await mongoClient.connect();
-      console.log("[Admin Service] Connected to MongoDB Atlas successfully");
+      return mongoClient.db(dbName);
     } catch (err: any) {
-      console.error("[Admin Service] MongoDB Connection failed. Switching to local fallback storage. Error:", err?.message || err);
-      mongoClient = null;
+      console.error("[Admin Service] MongoDB selection failed. Switching to local fallback storage. Error:", err?.message || err);
       useLocalFallback = true;
       return localDbMockInstance as any;
     }
   }
-  
-  try {
-    return mongoClient.db(dbName);
-  } catch (err: any) {
-    console.error("[Admin Service] MongoDB selection failed. Switching to local fallback storage. Error:", err?.message || err);
-    useLocalFallback = true;
+
+  if (connectionPromise) {
+    try {
+      const client = await connectionPromise;
+      if (client) {
+        return client.db(dbName);
+      }
+    } catch (e) {
+      // Handled in promise itself
+    }
     return localDbMockInstance as any;
   }
+
+  connectionPromise = (async () => {
+    try {
+      console.log("[Admin Service] Connecting to MongoDB...");
+      const client = new MongoClient(mongoUri, {
+        connectTimeoutMS: 4000,
+        socketTimeoutMS: 30000,
+      });
+      await client.connect();
+      console.log("[Admin Service] Connected to MongoDB Atlas successfully");
+      mongoClient = client;
+      connectionPromise = null;
+      return client;
+    } catch (err: any) {
+      console.error("[Admin Service] MongoDB Connection failed. Switching to local fallback storage. Error:", err?.message || err);
+      mongoClient = null;
+      connectionPromise = null;
+      useLocalFallback = true;
+      return null;
+    }
+  })();
+
+  const client = await connectionPromise;
+  if (client) {
+    return client.db(dbName);
+  }
+  return localDbMockInstance as any;
 }
 
 // Resilient database operation wrapper to gracefully catch and handle runtime connection/SSL errors
@@ -145,7 +166,7 @@ async function executeDbQuery<T>(fn: (db: any) => Promise<T>): Promise<T> {
   try {
     return await fn(db);
   } catch (err: any) {
-    if (!useLocalFallback) {
+    if (db !== localDbMockInstance) {
       console.error("[Admin Service] Database operation failed. Forcing local fallback and retrying...", err?.message || err);
       useLocalFallback = true;
       if (mongoClient) {
@@ -154,8 +175,7 @@ async function executeDbQuery<T>(fn: (db: any) => Promise<T>): Promise<T> {
         } catch (e) {}
         mongoClient = null;
       }
-      const fallbackDb = await getDb();
-      return await fn(fallbackDb);
+      return await fn(localDbMockInstance);
     }
     throw err;
   }
